@@ -5,26 +5,12 @@ import time
 from pathlib import Path
 
 import cv2
-import numpy as np
 
-from aruco_runtime import (
-    StableMarkerTracker,
-    attach_pose_estimates,
-    filter_marker_results,
-)
 from aruco_to_wall_coords import (
     OUTPUT_DIR as WALL_OUTPUT_DIR,
     convert_detection_to_wall_payload,
     print_wall_results,
     save_wall_json_with_prefix,
-)
-from camera_source import (
-    DEFAULT_CAMERA_INDEX,
-    DEFAULT_FRAME_HEIGHT,
-    DEFAULT_FRAME_WIDTH,
-    get_camera_debug_info,
-    open_camera,
-    read_bgr_frame,
 )
 
 
@@ -43,8 +29,7 @@ def parse_args():
     parser.add_argument(
         "--camera",
         type=int,
-        default=DEFAULT_CAMERA_INDEX,
-        help="Camera index for real-time detection. Default: 8",
+        help="Camera index for real-time detection, for example: 0",
     )
     parser.add_argument(
         "--dict",
@@ -54,14 +39,14 @@ def parse_args():
     parser.add_argument(
         "--width",
         type=int,
-        default=DEFAULT_FRAME_WIDTH,
-        help="Camera width for live mode. Default: 640",
+        default=1280,
+        help="Camera width for live mode. Default: 1280",
     )
     parser.add_argument(
         "--height",
         type=int,
-        default=DEFAULT_FRAME_HEIGHT,
-        help="Camera height for live mode. Default: 480",
+        default=720,
+        help="Camera height for live mode. Default: 720",
     )
     parser.add_argument(
         "--marker-size-mm",
@@ -79,36 +64,13 @@ def parse_args():
         default="top_left",
         help="Wall coordinate origin on the reference marker. Default: top_left",
     )
-    parser.add_argument(
-        "--target-marker-ids",
-        nargs="+",
-        type=int,
-        help="Optional marker IDs to keep as valid detections",
-    )
-    parser.add_argument(
-        "--min-stable-frames",
-        type=int,
-        default=3,
-        help="Frames required before a detection is considered stable. Default: 3",
-    )
-    parser.add_argument(
-        "--stable-center-threshold-px",
-        type=float,
-        default=30.0,
-        help="Max allowed center movement between frames. Default: 30 px",
-    )
-    parser.add_argument(
-        "--camera-matrix",
-        help="Optional path to camera matrix JSON for future pose estimation",
-    )
-    parser.add_argument(
-        "--dist-coeffs",
-        help="Optional path to distortion coefficients JSON for future pose estimation",
-    )
 
     args = parser.parse_args()
 
-    if args.image is not None and "--camera" in sys.argv:
+    if args.image is None and args.camera is None:
+        parser.error("请至少提供 --image 或 --camera 其中一种输入方式。")
+
+    if args.image is not None and args.camera is not None:
         parser.error("--image 和 --camera 不能同时使用。")
 
     return args
@@ -135,21 +97,22 @@ def load_image(image_path):
     return image
 
 
-def load_optional_matrix_json(path_text):
-    if path_text is None:
-        return None
+def open_camera(camera_index=0, width=None, height=None):
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开摄像头: {camera_index}")
 
-    path = Path(path_text)
-    if not path.exists() or not path.is_file():
-        raise FileNotFoundError(f"标定文件不存在: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    if width is not None:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    if height is not None:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
-
-def get_pose_inputs(args):
-    return {
-        "camera_matrix": load_optional_matrix_json(args.camera_matrix),
-        "dist_coeffs": load_optional_matrix_json(args.dist_coeffs),
-    }
+    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(
+        f"[INFO] Camera opened: index={camera_index}, size={actual_width}x{actual_height}"
+    )
+    return cap
 
 
 def get_aruco_dictionary(dict_name):
@@ -191,41 +154,14 @@ def compute_center(points):
     return center_x, center_y
 
 
-def build_marker_result(marker_corners, marker_id):
+def draw_marker_info(image, marker_corners, marker_id):
     points = marker_corners.reshape((4, 2)).astype(int)
-    return {
-        "id": int(marker_id),
-        "corners": [(int(x), int(y)) for x, y in points],
-        "center": compute_center(points),
-    }
+    center = compute_center(points)
 
-
-def collect_marker_results(corners, ids):
-    if ids is None or len(corners) == 0:
-        return []
-
-    return [
-        build_marker_result(marker_corners, marker_id)
-        for marker_corners, marker_id in zip(corners, ids.flatten())
-    ]
-
-
-def draw_marker_info(image, marker_result):
-    corners = marker_result["corners"]
-    center = marker_result["center"]
-    marker_id = marker_result["id"]
-    point_array = np.array(corners, dtype=np.int32)
-
-    cv2.polylines(
-        image,
-        [point_array.astype(int)],
-        isClosed=True,
-        color=(0, 255, 0),
-        thickness=2,
-    )
+    cv2.polylines(image, [points], isClosed=True, color=(0, 255, 0), thickness=2)
 
     labels = ["TL", "TR", "BR", "BL"]
-    for index, point in enumerate(corners):
+    for index, point in enumerate(points):
         point_tuple = (int(point[0]), int(point[1]))
         cv2.circle(image, point_tuple, 5, (0, 0, 255), -1)
         cv2.putText(
@@ -243,7 +179,7 @@ def draw_marker_info(image, marker_result):
     cv2.putText(
         image,
         f"ID {marker_id}",
-        (corners[0][0], corners[0][1] - 12),
+        (points[0][0], points[0][1] - 12),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         (0, 255, 0),
@@ -261,23 +197,28 @@ def draw_marker_info(image, marker_result):
         cv2.LINE_AA,
     )
 
+    return {
+        "id": int(marker_id),
+        "corners": [(int(x), int(y)) for x, y in points],
+        "center": center,
+    }
 
-def annotate_detection_result(image, results):
+
+def annotate_detection_result(image, corners, ids):
     annotated = image.copy()
-    for marker_result in results:
-        draw_marker_info(annotated, marker_result)
-    return annotated
+    results = []
+
+    if ids is None or len(corners) == 0:
+        return annotated, results
+
+    for marker_corners, marker_id in zip(corners, ids.flatten()):
+        marker_result = draw_marker_info(annotated, marker_corners, marker_id)
+        results.append(marker_result)
+
+    return annotated, results
 
 
-def build_detection_payload(
-    results,
-    frame_shape,
-    dictionary_name,
-    source,
-    marker_size_mm=None,
-    camera_matrix=None,
-    dist_coeffs=None,
-):
+def build_detection_payload(results, frame_shape, dictionary_name, source):
     height, width = frame_shape[:2]
     return {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -286,11 +227,6 @@ def build_detection_payload(
         "image_size": {
             "width": width,
             "height": height,
-        },
-        "pose_estimation": {
-            "marker_size_mm": marker_size_mm,
-            "camera_matrix": camera_matrix,
-            "dist_coeffs": dist_coeffs,
         },
         "marker_count": len(results),
         "markers": [
@@ -303,18 +239,17 @@ def build_detection_payload(
                     "x": result["center"][0],
                     "y": result["center"][1],
                 },
-                "pose": result.get("pose"),
             }
             for result in results
         ],
     }
 
 
-def format_results_text(results, title="[INFO] 检测结果"):
+def format_results_text(results):
     if not results:
         return "[INFO] 未检测到 Aruco 标签。"
 
-    lines = [f"{title}: {len(results)} 个 Aruco 标签"]
+    lines = [f"[INFO] 检测到 {len(results)} 个 Aruco 标签:"]
     for result in results:
         lines.append(f"  - ID: {result['id']}")
         lines.append(f"    四个角点: {result['corners']}")
@@ -322,8 +257,8 @@ def format_results_text(results, title="[INFO] 检测结果"):
     return "\n".join(lines)
 
 
-def print_detection_results(results, title="[INFO] 检测结果"):
-    print(format_results_text(results, title=title))
+def print_detection_results(results):
+    print(format_results_text(results))
 
 
 def build_output_path(prefix, output_dir):
@@ -395,19 +330,15 @@ def show_image_result(image, image_path, output_dir, payload):
     cv2.destroyAllWindows()
 
 
-def draw_live_info(frame, frame_count, start_time, stable_results=None):
+def draw_live_info(frame, frame_count, start_time):
     elapsed = time.time() - start_time
     fps = frame_count / elapsed if elapsed > 0 else 0.0
     height, width = frame.shape[:2]
-    stable_ids = (
-        ",".join(str(result["id"]) for result in stable_results) if stable_results else "-"
-    )
 
     info_lines = [
         f"Resolution: {width}x{height}",
         f"Frame: {frame_count}",
         f"FPS: {fps:.2f}",
-        f"Stable IDs: {stable_ids}",
         "Press 's' to save frame",
         "Press 'q' to quit",
     ]
@@ -429,33 +360,19 @@ def draw_live_info(frame, frame_count, start_time, stable_results=None):
     return frame
 
 
-def filter_and_enrich_results(results, args, pose_inputs):
-    filtered_results = filter_marker_results(results, args.target_marker_ids)
-    return attach_pose_estimates(
-        filtered_results,
-        marker_size_mm=args.marker_size_mm,
-        camera_matrix=pose_inputs["camera_matrix"],
-        dist_coeffs=pose_inputs["dist_coeffs"],
-    )
-
-
-def run_image_mode(args, dictionary_name, dictionary, output_dir, pose_inputs):
-    image_path = validate_image_path(args.image)
+def run_image_mode(args, dictionary_name, dictionary, output_dir):
+    image_arg = args.image
+    image_path = validate_image_path(image_arg)
     image = load_image(image_path)
     corners, ids, _ = detect_markers(image, dictionary)
-    results = collect_marker_results(corners, ids)
-    effective_results = filter_and_enrich_results(results, args, pose_inputs)
-    annotated_image = annotate_detection_result(image, effective_results)
+    annotated_image, results = annotate_detection_result(image, corners, ids)
     payload = build_detection_payload(
-        results=effective_results,
+        results=results,
         frame_shape=image.shape,
         dictionary_name=dictionary_name,
         source=str(image_path),
-        marker_size_mm=args.marker_size_mm,
-        camera_matrix=pose_inputs["camera_matrix"],
-        dist_coeffs=pose_inputs["dist_coeffs"],
     )
-    print_detection_results(effective_results)
+    print_detection_results(results)
     save_detection_json(payload, image_path.stem, output_dir)
     export_wall_coordinates(
         detection_payload=payload,
@@ -467,67 +384,39 @@ def run_image_mode(args, dictionary_name, dictionary, output_dir, pose_inputs):
     show_image_result(annotated_image, image_path, output_dir, payload)
 
 
-def run_camera_mode(args, dictionary_name, dictionary, output_dir, pose_inputs):
-    cap = open_camera(
-        camera_index=args.camera,
-        width=args.width,
-        height=args.height,
-    )
-    debug_info = get_camera_debug_info(cap, args.camera)
-    print(f"requested camera index = {debug_info['requested_camera_index']}")
-    print(f"cap.isOpened() = {debug_info['opened']}")
-    print(f"actual width = {debug_info['actual_width']}")
-    print(f"actual height = {debug_info['actual_height']}")
-    print(f"actual fourcc = {debug_info['actual_fourcc']}")
-
-    if not cap.isOpened():
-        raise RuntimeError(f"无法打开摄像头: {args.camera}")
-
-    tracker = StableMarkerTracker(
-        min_stable_frames=args.min_stable_frames,
-        max_center_jump_px=args.stable_center_threshold_px,
-    )
+def run_camera_mode(args, dictionary_name, dictionary, output_dir):
+    camera_index = args.camera
+    width = args.width
+    height = args.height
+    cap = open_camera(camera_index=camera_index, width=width, height=height)
     frame_count = 0
     start_time = time.time()
-    last_printed_text = None
+    last_result_text = None
 
-    print("[INFO] 实时检测已启动，按 'q' 退出，按 's' 保存当前稳定结果。")
+    print("[INFO] 实时检测已启动，按 'q' 退出，按 's' 保存当前结果帧。")
 
     try:
         while True:
-            ret, frame = read_bgr_frame(cap)
+            ret, frame = cap.read()
             if not ret or frame is None:
                 print("[ERROR] 读取摄像头帧失败")
                 break
 
             frame_count += 1
-            if frame_count == 1:
-                print(f"first frame shape = {frame.shape}")
-
             corners, ids, _ = detect_markers(frame, dictionary)
-            raw_results = collect_marker_results(corners, ids)
-            filtered_results = filter_and_enrich_results(raw_results, args, pose_inputs)
-            stable_results, events = tracker.update(filtered_results)
-
-            for event in events:
-                print(event)
-
-            annotated_frame = annotate_detection_result(frame, filtered_results)
-            display_frame = draw_live_info(
-                annotated_frame,
-                frame_count,
-                start_time,
-                stable_results=stable_results,
+            annotated_frame, results = annotate_detection_result(frame, corners, ids)
+            display_frame = draw_live_info(annotated_frame, frame_count, start_time)
+            payload = build_detection_payload(
+                results=results,
+                frame_shape=frame.shape,
+                dictionary_name=dictionary_name,
+                source=f"camera:{camera_index}",
             )
 
-            if stable_results:
-                result_text = format_results_text(
-                    stable_results,
-                    title="[INFO] 当前稳定检测结果",
-                )
-                if result_text != last_printed_text:
-                    print(result_text)
-                    last_printed_text = result_text
+            result_text = format_results_text(results)
+            if result_text != last_result_text:
+                print(result_text)
+                last_result_text = result_text
 
             cv2.imshow(WINDOW_NAME, display_frame)
             key = cv2.waitKey(1) & 0xFF
@@ -536,16 +425,6 @@ def run_camera_mode(args, dictionary_name, dictionary, output_dir, pose_inputs):
                 print("[INFO] Quit.")
                 break
             if key == ord("s"):
-                export_results = stable_results or filtered_results
-                payload = build_detection_payload(
-                    results=export_results,
-                    frame_shape=frame.shape,
-                    dictionary_name=dictionary_name,
-                    source=f"camera:{args.camera}",
-                    marker_size_mm=args.marker_size_mm,
-                    camera_matrix=pose_inputs["camera_matrix"],
-                    dist_coeffs=pose_inputs["dist_coeffs"],
-                )
                 save_result_image(display_frame, "camera", output_dir)
                 save_detection_json(payload, "camera", output_dir)
                 export_wall_coordinates(
@@ -569,12 +448,11 @@ def main():
         dictionary_name = args.dict
         dictionary = get_aruco_dictionary(dictionary_name)
         output_dir = ensure_output_dir()
-        pose_inputs = get_pose_inputs(args)
 
         if args.image is not None:
-            run_image_mode(args, dictionary_name, dictionary, output_dir, pose_inputs)
+            run_image_mode(args, dictionary_name, dictionary, output_dir)
         else:
-            run_camera_mode(args, dictionary_name, dictionary, output_dir, pose_inputs)
+            run_camera_mode(args, dictionary_name, dictionary, output_dir)
 
     except Exception as exc:
         print(f"[ERROR] {exc}")
