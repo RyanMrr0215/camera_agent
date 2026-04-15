@@ -10,33 +10,44 @@ from aruco_detect import (
     WINDOW_NAME,
     annotate_detection_result,
     build_detection_payload,
+    collect_marker_results,
     detect_markers,
     draw_live_info,
+    filter_and_enrich_results,
     format_results_text,
     get_aruco_dictionary,
+    get_pose_inputs,
     load_image,
-    open_camera,
     save_detection_json,
     save_result_image,
     validate_image_path,
 )
+from aruco_runtime import StableMarkerTracker
 from aruco_to_wall_coords import (
     OUTPUT_DIR as WALL_OUTPUT_DIR,
     convert_detection_to_wall_payload,
     print_wall_results,
     save_wall_json_with_prefix,
 )
-from projection_targets import (
-    OUTPUT_DIR as PROJECTION_OUTPUT_DIR,
-    convert_wall_to_projection_payload,
-    print_projection_targets,
-    save_projection_json_with_prefix,
+from camera_source import (
+    DEFAULT_CAMERA_INDEX,
+    DEFAULT_FRAME_HEIGHT,
+    DEFAULT_FRAME_WIDTH,
+    get_camera_debug_info,
+    open_camera,
+    read_bgr_frame,
 )
 from projection_executor_stub import (
     OUTPUT_DIR as EXECUTION_OUTPUT_DIR,
     convert_projection_to_execution_payload,
     print_execution_summary,
     save_execution_json_with_prefix,
+)
+from projection_targets import (
+    OUTPUT_DIR as PROJECTION_OUTPUT_DIR,
+    convert_wall_to_projection_payload,
+    print_projection_targets,
+    save_projection_json_with_prefix,
 )
 
 
@@ -51,7 +62,7 @@ def parse_args():
     parser.add_argument(
         "--camera",
         type=int,
-        default=8,
+        default=DEFAULT_CAMERA_INDEX,
         help="Camera index for real-time pipeline. Default: 8",
     )
     parser.add_argument(
@@ -62,14 +73,14 @@ def parse_args():
     parser.add_argument(
         "--width",
         type=int,
-        default=1280,
-        help="Camera width for live mode. Default: 1280",
+        default=DEFAULT_FRAME_WIDTH,
+        help="Camera width for live mode. Default: 640",
     )
     parser.add_argument(
         "--height",
         type=int,
-        default=720,
-        help="Camera height for live mode. Default: 720",
+        default=DEFAULT_FRAME_HEIGHT,
+        help="Camera height for live mode. Default: 480",
     )
     parser.add_argument(
         "--marker-size-mm",
@@ -80,7 +91,7 @@ def parse_args():
     parser.add_argument(
         "--origin-marker-id",
         type=int,
-        help="Marker ID used as wall origin. Default: first detected marker",
+        help="Marker ID used as wall origin. Default: first detected stable marker",
     )
     parser.add_argument(
         "--origin",
@@ -98,7 +109,19 @@ def parse_args():
         "--target-marker-ids",
         nargs="+",
         type=int,
-        help="Optional marker IDs to export as projection targets",
+        help="Optional marker IDs to keep as valid detections and projection targets",
+    )
+    parser.add_argument(
+        "--min-stable-frames",
+        type=int,
+        default=3,
+        help="Frames required before a detection is considered stable. Default: 3",
+    )
+    parser.add_argument(
+        "--stable-center-threshold-px",
+        type=float,
+        default=30.0,
+        help="Max allowed center movement between frames. Default: 30 px",
     )
     parser.add_argument(
         "--label-prefix",
@@ -145,12 +168,18 @@ def parse_args():
         default="laser_projector_stub",
         help="Execution queue device name. Default: laser_projector_stub",
     )
+    parser.add_argument(
+        "--camera-matrix",
+        help="Optional path to camera matrix JSON for future pose estimation",
+    )
+    parser.add_argument(
+        "--dist-coeffs",
+        help="Optional path to distortion coefficients JSON for future pose estimation",
+    )
 
     args = parser.parse_args()
-
-    if args.image is not None and args.camera is not None:
+    if args.image is not None and "--camera" in sys.argv:
         parser.error("--image 和 --camera 不能同时使用。")
-
     return args
 
 
@@ -205,18 +234,24 @@ def export_pipeline_outputs(detection_payload, image_to_save, prefix, args):
 def run_image_mode(args):
     image_path = validate_image_path(args.image)
     dictionary = get_aruco_dictionary(args.dict)
+    pose_inputs = get_pose_inputs(args)
     image = load_image(image_path)
 
     corners, ids, _ = detect_markers(image, dictionary)
-    annotated_image, results = annotate_detection_result(image, corners, ids)
+    raw_results = collect_marker_results(corners, ids)
+    effective_results = filter_and_enrich_results(raw_results, args, pose_inputs)
+    annotated_image = annotate_detection_result(image, effective_results)
     detection_payload = build_detection_payload(
-        results=results,
+        results=effective_results,
         frame_shape=image.shape,
         dictionary_name=args.dict,
         source=str(image_path),
+        marker_size_mm=args.marker_size_mm,
+        camera_matrix=pose_inputs["camera_matrix"],
+        dist_coeffs=pose_inputs["dist_coeffs"],
     )
 
-    print(format_results_text(results))
+    print(format_results_text(effective_results))
     export_pipeline_outputs(
         detection_payload=detection_payload,
         image_to_save=annotated_image,
@@ -245,8 +280,26 @@ def run_image_mode(args):
 
 def run_camera_mode(args):
     dictionary = get_aruco_dictionary(args.dict)
-    cap, first_ret, first_frame, source_label = open_camera(
-        camera_index=args.camera, width=args.width, height=args.height
+    pose_inputs = get_pose_inputs(args)
+
+    cap = open_camera(
+        camera_index=args.camera,
+        width=args.width,
+        height=args.height,
+    )
+    debug_info = get_camera_debug_info(cap, args.camera)
+    print(f"requested camera index = {debug_info['requested_camera_index']}")
+    print(f"cap.isOpened() = {debug_info['opened']}")
+    print(f"actual width = {debug_info['actual_width']}")
+    print(f"actual height = {debug_info['actual_height']}")
+    print(f"actual fourcc = {debug_info['actual_fourcc']}")
+
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开摄像头: {args.camera}")
+
+    tracker = StableMarkerTracker(
+        min_stable_frames=args.min_stable_frames,
+        max_center_jump_px=args.stable_center_threshold_px,
     )
     frame_count = 0
     start_time = time.time()
@@ -256,31 +309,51 @@ def run_camera_mode(args):
 
     try:
         while True:
-            if frame_count == 0:
-                ret, frame = first_ret, first_frame
-            else:
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUY2)
+            ret, frame = read_bgr_frame(cap)
             if not ret or frame is None:
                 print("[ERROR] 读取摄像头帧失败")
                 break
 
             frame_count += 1
             corners, ids, _ = detect_markers(frame, dictionary)
-            annotated_frame, results = annotate_detection_result(frame, corners, ids)
-            display_frame = draw_live_info(annotated_frame.copy(), frame_count, start_time)
-            detection_payload = build_detection_payload(
-                results=results,
-                frame_shape=frame.shape,
-                dictionary_name=args.dict,
-                source=f"camera:{source_label}",
-            )
+            raw_results = collect_marker_results(corners, ids)
+            filtered_results = filter_and_enrich_results(raw_results, args, pose_inputs)
+            stable_results, events = tracker.update(filtered_results)
 
-            result_text = format_results_text(results)
-            if result_text != last_result_text:
-                print(result_text)
-                last_result_text = result_text
+            for event in events:
+                print(event)
+
+            stable_origin_result = None
+            if args.origin_marker_id is None and stable_results:
+                stable_origin_result = stable_results[0]
+            elif args.origin_marker_id is not None:
+                stable_origin_result = next(
+                    (result for result in stable_results if result["id"] == args.origin_marker_id),
+                    None,
+                )
+
+            if stable_origin_result is not None and args.origin_marker_id is None:
+                args.origin_marker_id = stable_origin_result["id"]
+
+            if stable_origin_result is not None:
+                result_text = format_results_text(
+                    stable_results,
+                    title="[INFO] 当前稳定检测结果",
+                )
+                if result_text != last_result_text:
+                    print(result_text)
+                    print(
+                        f"[INFO] origin marker 已稳定: ID {stable_origin_result['id']}"
+                    )
+                    last_result_text = result_text
+
+            annotated_frame = annotate_detection_result(frame, filtered_results)
+            display_frame = draw_live_info(
+                annotated_frame.copy(),
+                frame_count,
+                start_time,
+                stable_results=stable_results,
+            )
 
             cv2.imshow(WINDOW_NAME, display_frame)
             key = cv2.waitKey(1) & 0xFF
@@ -288,7 +361,21 @@ def run_camera_mode(args):
             if key == ord("q"):
                 print("[INFO] Quit.")
                 break
+
             if key == ord("s"):
+                if stable_origin_result is None:
+                    print("[INFO] origin marker 尚未稳定，跳过当前导出。")
+                    continue
+
+                detection_payload = build_detection_payload(
+                    results=stable_results,
+                    frame_shape=frame.shape,
+                    dictionary_name=args.dict,
+                    source=f"camera:{args.camera}",
+                    marker_size_mm=args.marker_size_mm,
+                    camera_matrix=pose_inputs["camera_matrix"],
+                    dist_coeffs=pose_inputs["dist_coeffs"],
+                )
                 try:
                     export_pipeline_outputs(
                         detection_payload=detection_payload,

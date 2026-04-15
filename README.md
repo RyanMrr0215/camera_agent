@@ -13,6 +13,7 @@
 当前阶段不依赖 RealSense SDK，不处理深度，不依赖训练模型。
 当前项目仍然使用普通 OpenCV/V4L2 相机读取，不依赖 RealSense SDK。
 在当前 Linux 机器上，RealSense 可通过 `camera index 8` 使用。
+当前 ArUco 检测建议优先使用打印出来的纯净 marker，而不是带 UI 元素的手机屏幕。
 
 ## 1. 项目结构
 
@@ -177,6 +178,12 @@ python3 aruco_detect.py --image path/to/image.jpg
 
 ```bash
 python3 aruco_detect.py --camera 8
+```
+
+带目标 ID 白名单和连续稳定确认：
+
+```bash
+python3 aruco_detect.py --camera 8 --target-marker-ids 37 --min-stable-frames 3
 ```
 
 如果想同时导出墙面坐标：
@@ -347,6 +354,31 @@ python3 camera_pipeline.py \
   --target-type centers \
   --export-execution-queue
 ```
+
+说明：
+
+- `camera_pipeline.py` 在实时摄像头模式下，需要在窗口中按 `s` 才会导出当前结果。
+- 按下 `s` 后会导出当前帧对应的 `aruco_detect`、`wall_coords`、`projection_targets`，如果启用了 `--export-execution-queue`，还会继续导出 `execution_queue`。
+- `--origin-marker-id` 只用于定义 wall coordinate origin，不会限制保留哪些 marker。
+- 如果没有显式传 `--target-marker-ids`，则会保留所有通过检测与稳定判定的 marker。
+- 更换 `--origin-marker-id` 只会改变坐标系原点，不会改变 marker 集合。
+
+当前 Linux + RealSense 环境推荐命令：
+
+```bash
+python camera_pipeline.py \
+  --camera 8 \
+  --dict DICT_4X4_50 \
+  --width 1280 \
+  --height 720 \
+  --marker-size-mm 50 \
+  --origin-marker-id 37 \
+  --origin top_left \
+  --target-type centers \
+  --export-execution-queue
+```
+
+当左上角出现多个稳定 ID 时，按 `s` 保存当前完整结果，按 `q` 退出。
 
 执行队列时间参数也可以在这里直接设置：
 
